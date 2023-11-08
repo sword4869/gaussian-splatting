@@ -12,7 +12,7 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, l2_loss, ssim
 from gaussian_renderer import render, network_gui
 import sys
 from scene import Scene, GaussianModel
@@ -28,11 +28,11 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, load_iteration):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians)
+    scene = Scene(dataset, gaussians, load_iteration)
     gaussians.training_setup(opt)
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
@@ -98,7 +98,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
+                progress_bar.set_postfix({
+                    "Loss": f"{ema_loss_for_log:.{7}f}", 
+                    "num_points": f"{scene.gaussians.get_xyz.shape[0]}",
+                })
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -116,8 +119,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                    old_num_points = scene.gaussians.get_xyz.shape[0]
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    if tb_writer:
+                        tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
+                        tb_writer.add_scalar('delta_points', scene.gaussians.get_xyz.shape[0] - old_num_points, iteration)
                 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -184,11 +191,16 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
+        torch.cuda.empty_cache()
 
+    if iteration % 5000 == 0:
         if tb_writer:
             tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-            tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
-        torch.cuda.empty_cache()
+            tb_writer.add_histogram("scene/scaling_histogram", scene.gaussians.get_scaling, iteration)
+            tb_writer.add_histogram("scene/rotation_histogram", scene.gaussians.get_rotation, iteration)
+            tb_writer.add_histogram("scene/_features_dc_histogram", scene.gaussians._features_dc, iteration)
+            tb_writer.add_histogram("scene/_features_rest_histogram", scene.gaussians._features_rest, iteration)
+            tb_writer.add_histogram("scene/features_rest_histogram", scene.gaussians.get_features, iteration)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -205,6 +217,7 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--load_iteration", type=int, default = None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -216,7 +229,7 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.load_iteration)
 
     # All done
     print("\nTraining complete.")
